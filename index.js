@@ -1,143 +1,135 @@
-const express = require('express');
-const fetch = require('node-fetch');
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(cors());
 
-// Solo este placeId
-const PLACE_ID = 109983668079237;
+const PLACE_ID = +(process.env.PLACE_ID || "109983668079237");
+const DEFAULT_TARGET = +(process.env.TARGET_COUNT || "500");
+const PER_PAGE = 100;
+const PAGE_DELAY_MS = +(process.env.PAGE_DELAY_MS || "120");
+const CACHE_TTL_MS = +(process.env.CACHE_TTL_MS || "120000");
 
-const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutos
-const PER_PLACE_LIMIT = 500;
-const PAGE_LIMIT = 100;
-const PAGE_SLEEP_MS = 120;
-const RETRY_SLEEP_MS = 400;
-const MAX_PAGES = 80;
-const REQUIRE_FREE_SLOTS = true;
-
-let cache = { expiresAt: 0, servers: [] };
+let lastCache = { when: 0, key: "", payload: null };
 
 function sleep(ms) {
-  return new Promise(res => setTimeout(res, ms));
-}
-
-async function fetchRobloxPage(placeId, cursor) {
-  const url = new URL(`https://games.roblox.com/v1/games/${placeId}/servers/Public`);
-  url.searchParams.set('sortOrder', 'Asc');
-  url.searchParams.set('limit', PAGE_LIMIT.toString());
-  if (cursor) url.searchParams.set('cursor', cursor);
-
-  try {
-    const resp = await fetch(url.toString(), {
-      method: 'GET',
-      headers: { 'accept': 'application/json' },
-      timeout: 15000
-    });
-    if (!resp.ok) return { ok: false, status: resp.status };
-    const data = await resp.json();
-    return { ok: true, data };
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-}
-
-function normalizeServers(list) {
-  const out = [];
-  for (const s of list || []) {
-    if (!s || !s.id) continue;
-    out.push({
-      id: s.id,
-      maxPlayers: s.maxPlayers || 0,
-      playing: s.playing || 0
-    });
-  }
-  return out;
-}
-
-function uniqueById(arr) {
-  const m = new Map();
-  for (const s of arr) {
-    if (!m.has(s.id)) m.set(s.id, s);
-  }
-  return Array.from(m.values());
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function shuffle(arr) {
   for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = (Math.random() * (i + 1)) | 0;
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr;
 }
 
-async function collectServers() {
-  const collected = [];
-  let cursor = undefined;
-  let pages = 0;
+async function fetchPage(placeId, cursor = null) {
+  const url =
+    `https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Asc&limit=${PER_PAGE}` +
+    (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+  const { data } = await axios.get(url, {
+    timeout: 15000,
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (compatible; PetFinder/1.0; +https://railway.app/)",
+      accept: "application/json",
+    },
+  });
+  return data;
+}
 
-  while (collected.length < PER_PLACE_LIMIT && pages < MAX_PAGES) {
-    const r = await fetchRobloxPage(PLACE_ID, cursor);
-    if (!r.ok || !r.data || !Array.isArray(r.data.data)) {
-      await sleep(RETRY_SLEEP_MS);
-      pages++;
-      continue;
+async function fetchServersFresh(placeId, targetCount) {
+  const out = [];
+  const seen = new Set();
+  let cursor = null;
+
+  while (out.length < targetCount) {
+    const page = await fetchPage(placeId, cursor);
+    const data = Array.isArray(page?.data) ? page.data : [];
+
+    for (const s of data) {
+      if (!s || !s.id) continue;
+      if (seen.has(s.id)) continue;
+      seen.add(s.id);
+      if (typeof s.playing === "number" && typeof s.maxPlayers === "number") {
+        out.push({
+          id: s.id,
+          maxPlayers: s.maxPlayers,
+          playing: s.playing,
+          players: [], // compat
+        });
+      }
+      if (out.length >= targetCount) break;
     }
 
-    const batch = normalizeServers(r.data.data).filter(s => {
-      return REQUIRE_FREE_SLOTS ? (s.playing < s.maxPlayers) : true;
-    });
-
-    for (const s of batch) {
-      if (collected.length < PER_PLACE_LIMIT) collected.push(s);
-      else break;
-    }
-
-    cursor = r.data.nextPageCursor || null;
-    pages++;
-    if (!cursor) break;
-
-    await sleep(PAGE_SLEEP_MS);
+    if (!page.nextPageCursor) break;
+    cursor = page.nextPageCursor;
+    await sleep(PAGE_DELAY_MS);
   }
-
-  return collected;
+  return out;
 }
 
-async function refreshCache() {
-  let servers = await collectServers();
-  servers = shuffle(servers);
-  servers = uniqueById(servers);
-  if (servers.length > 500) servers = servers.slice(0, 500);
-
-  cache.servers = servers;
-  cache.expiresAt = Date.now() + CACHE_TTL_MS;
-  return servers;
-}
-
-app.get('/health', (req, res) => {
+app.get("/", (req, res) => {
   res.json({
     ok: true,
-    status: 'up',
-    cachedCount: cache.servers.length,
-    expiresIn: Math.max(0, cache.expiresAt - Date.now())
+    service: "petfinder-api",
+    endpoints: ["/servers", "/health"],
+    placeId: PLACE_ID,
   });
 });
 
-app.get('/servers', async (req, res) => {
-  const now = Date.now();
+app.get("/health", (req, res) => {
+  res.json({ ok: true, status: "healthy", time: Date.now() });
+});
 
-  if (cache.expiresAt > now && cache.servers.length > 0) {
-    res.json({ ok: true, success: true, totalFetched: cache.servers.length, servers: cache.servers });
-    return;
-  }
-
+app.get("/servers", async (req, res) => {
   try {
-    const fresh = await refreshCache();
-    res.json({ ok: true, success: true, totalFetched: fresh.length, servers: fresh });
-  } catch (e) {
-    res.status(500).json({ ok: false, success: false, error: e.message });
+    const placeId = +(req.query.placeId || PLACE_ID);
+    const wanted = Math.max(
+      1,
+      Math.min(+req.query.count || DEFAULT_TARGET, 500)
+    );
+    const onlyJoinable =
+      String(req.query.onlyJoinable || "1") === "1" ? true : false;
+    const doShuffle = String(req.query.shuffle || "1") === "1";
+    const bypass = String(req.query.fresh || "0") === "1";
+
+    const cacheKey = `${placeId}:${wanted}:${onlyJoinable}:${doShuffle}`;
+    const now = Date.now();
+    if (!bypass && lastCache.payload && lastCache.key === cacheKey && now - lastCache.when < CACHE_TTL_MS) {
+      return res.json(lastCache.payload);
+    }
+
+    let list = await fetchServersFresh(placeId, wanted * 2);
+    if (onlyJoinable) {
+      list = list.filter((s) => s.playing < s.maxPlayers);
+    }
+    if (doShuffle) shuffle(list);
+    list = list.slice(0, wanted);
+
+    const payload = {
+      ok: true,
+      success: true,
+      totalFetched: list.length,
+      servers: list,
+    };
+
+    lastCache = { when: now, key: cacheKey, payload };
+    res.json(payload);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      success: false,
+      error: String(err && err.message ? err.message : err),
+      servers: [],
+      totalFetched: 0,
+    });
   }
 });
 
+const PORT = process.env.PORT || process.env.RAILWAY_TCP_PORT || 8080;
 app.listen(PORT, () => {
-  console.log('listening on', PORT);
+  console.log("petfinder-api listening on", PORT);
 });
