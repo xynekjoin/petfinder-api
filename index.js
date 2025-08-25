@@ -11,7 +11,6 @@ app.use(express.json());
 const ROBLOX_API_BASE = 'https://games.roblox.com/v1/games';
 const MAX_SERVERS = 100;
 const PLACE_ID = 109983668079237
-const PLACE_ID_2 = 96342491571673
 
 async function getRobloxServers(placeId, cursor = '') {
     try {
