@@ -1,156 +1,100 @@
-// index.js
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 
-const app  = express();
-const PORT = process.env.PORT || 8080;
+const app = express();
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
 
-// --------- CONFIG ----------
-const PLACE_ID     = 109983668079237;  // único place
-const TARGET_COUNT = 500;              // servidores por ciclo
-const PER_PAGE     = 100;              // roblox máximo
-const REFRESH_MS   = 15 * 60 * 1000;   // 15 minutos
-const BASE         = 'https://games.roblox.com/v1/games';
-// ---------------------------
+const ROBLOX_API_BASE = 'https://games.roblox.com/v1/games';
+const MAX_SERVERS = 100;
+const PLACE_ID = 109983668079237
+const PLACE_ID_2 = 96342491571673
 
-let cache = { servers: [], updatedAt: 0 };
-let fetching = false;
-let waiters  = [];
+async function getRobloxServers(placeId, cursor = '') {
+    try {
+        const url = `${ROBLOX_API_BASE}/${placeId}/servers/Public`;
+        const params = {
+            limit: MAX_SERVERS,
+            sortOrder: 'Des',
+            cursor: cursor || undefined,
+            excludeFullGames: true
+        };
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        Object.keys(params).forEach(key => params[key] === undefined && delete params[key]);
 
-async function getRobloxPage(cursor, attempt = 1) {
-  const url = `${BASE}/${PLACE_ID}/servers/Public`;
-  try {
-    const { data } = await axios.get(url, {
-      timeout: 12000,
-      params: {
-        limit: PER_PAGE,
-        sortOrder: 'Asc',       // 'Desc' también sirve; Asc suele ser más estable
-        cursor: cursor || undefined,
-        excludeFullGames: true
-      },
-      headers: {
-        'Accept': 'application/json, text/plain, */*',
-        'Origin': 'https://www.roblox.com',
-        'Referer': `https://www.roblox.com/games/${PLACE_ID}`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'
-      }
+        const response = await axios.get(url, {
+            params,
+            timeout: 10000,
+            headers: {
+                'User-Agent': 'Roblox-Servers-MicroAPI/1.0',
+                'Accept': 'application/json'
+            }
+        });
+
+        return response.data;
+    } catch (error) {
+        console.error('Error fetching Roblox servers:', error.message);
+        throw new Error(`Failed to fetch servers: ${error.response?.data?.message || error.message}`);
+    }
+}
+
+app.get('/', (req, res) => {
+    res.json({
+        message: 'Roblox Servers MicroAPI',
+        endpoints: {
+            getServers: 'GET /servers/:placeId',
+            health: 'GET /health'
+        },
+        documentation: 'Use /servers/:placeId para obtener servidores de un place especÃ­fico'
     });
-    return data;
-  } catch (err) {
-    const status = err.response?.status;
-    // reintentos con backoff para 429/5xx
-    if ((status === 429 || status >= 500) && attempt < 8) {
-      const wait = Math.min(2000 * attempt + Math.random() * 800, 8000);
-      await sleep(wait);
-      return getRobloxPage(cursor, attempt + 1);
-    }
-    throw err;
-  }
-}
-
-async function collectServers() {
-  const out  = [];
-  const seen = new Set();
-  let cursor = undefined;
-
-  while (out.length < TARGET_COUNT) {
-    const page = await getRobloxPage(cursor);
-    const list = Array.isArray(page?.data) ? page.data : [];
-    for (const s of list) {
-      if (!s?.id || seen.has(s.id)) continue;
-      if (typeof s.playing === 'number' && typeof s.maxPlayers === 'number') {
-        if (s.playing >= s.maxPlayers) continue;
-      }
-      seen.add(s.id);
-      out.push({
-        id: s.id,
-        maxPlayers: s.maxPlayers,
-        playing: s.playing,
-        ping: s.ping,
-        fps: s.fps
-      });
-      if (out.length >= TARGET_COUNT) break;
-    }
-    cursor = page?.nextPageCursor || null;
-    if (!cursor) break;
-    await sleep(220); // throttle suave
-  }
-  return out;
-}
-
-async function refresh() {
-  if (fetching) return new Promise(r => waiters.push(r));
-  fetching = true;
-  try {
-    const servers = await collectServers();
-    cache = { servers, updatedAt: Date.now() };
-    console.log(`[refresh] fetched: ${servers.length}`);
-  } finally {
-    fetching = false;
-    while (waiters.length) waiters.shift()();
-  }
-}
-
-// cron
-setInterval(() => refresh().catch(()=>{}), REFRESH_MS);
-// primer warm up
-refresh().catch(e => console.log('warm-up error:', e?.message || e));
-
-// ---------- ROUTES ----------
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    name: 'petfinder-api',
-    placeId: PLACE_ID,
-    refreshEachMs: REFRESH_MS,
-    target: TARGET_COUNT,
-    endpoints: ['/servers', '/health']
-  });
 });
 
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'healthy',
-    totalCached: cache.servers.length,
-    updatedAt: cache.updatedAt,
-    uptime: process.uptime()
-  });
+// Ruta de health check
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
 });
 
 app.get('/servers', async (req, res) => {
-  const force = String(req.query.refresh || '') === '1';
-  try {
-    if (force) {
-      await refresh();
-    } else if (Date.now() - cache.updatedAt > REFRESH_MS * 1.5 || cache.servers.length === 0) {
-      refresh().catch(()=>{});
+    const { cursor } = req.query;
+
+    try {
+        console.log(`Fetching servers...`);
+        const serversData = await getRobloxServers(PLACE_ID, cursor);
+        res.json({
+            success: true,
+            data: serversData,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error(`Error for place ${placeId}:`, error.message);
+
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            placeId: parseInt(placeId),
+            timestamp: new Date().toISOString()
+        });
     }
-    res.json({
-      ok: true,
-      success: true,
-      totalFetched: cache.servers.length,
-      servers: cache.servers,
-      updatedAt: cache.updatedAt
-    });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      success: false,
-      error: err?.message || String(err),
-      servers: [],
-      totalFetched: 0,
-      updatedAt: cache.updatedAt || 0
-    });
-  }
 });
 
-app.use('*', (_req, res) => res.status(404).json({ ok:false, error:'not_found' }));
+app.use('*', (req, res) => {
+    res.status(404).json({
+        error: 'Endpoint not found',
+        message: 'Check the documentation at the root endpoint'
+    });
+});
 
-app.listen(PORT, () => console.log(`petfinder-api listening on ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`ðŸš€ Roblox Servers MicroAPI running on port ${PORT}`);
+    console.log(`ðŸ“š Documentation: http://localhost:${PORT}`);
+});
+
 module.exports = app;
