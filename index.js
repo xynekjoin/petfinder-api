@@ -1,140 +1,172 @@
-const express = require("express");
-const fetch = require("node-fetch");
+// Adaptado para: 500 servidores frescos cada 15 minutos
+// Basado en la estructura original 
 
-const app = express();
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
+
+const app  = express();
 const PORT = process.env.PORT || 8080;
 
-const PLACE_ID = process.env.PLACE_ID || "109983668079237";
-const MAX_TOTAL = 500;
-const PAGE_LIMIT = 100;
-const REFRESH_EVERY_MS = 15 * 60 * 1000;
+app.use(cors());
+app.use(express.json());
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36";
+const PLACE_ID        = 109983668079237;          // único place
+const PER_PAGE        = 100;                      // Roblox máx 100
+const TARGET_TOTAL    = 500;                      // 500 por ciclo
+const REFRESH_MS      = 15 * 60 * 1000;           // 15 minutos
+const ROBLOX_ENDPOINT = `https://games.roblox.com/v1/games/${PLACE_ID}/servers/Public`;
 
-let cache = {
-  ok: true,
-  success: true,
-  totalFetched: 0,
-  servers: [],
-  updatedAt: 0,
-};
+let cache = { servers: [], updatedAt: 0 };
+let isRefreshing = false;
+let waiters = [];
 
-function wait(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+// util: dormir ms
+const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function fetchPage(placeId, cursor) {
-  const url = `https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Asc&limit=${PAGE_LIMIT}${
-    cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""
-  }`;
+// request de una página con reintentos/backoff (maneja 429/5xx)
+async function getPage(cursor, tryNo = 1) {
+  const params = {
+    limit: PER_PAGE,
+    sortOrder: 'Asc',
+    cursor: cursor || undefined,
+    excludeFullGames: true
+  };
 
-  // Ritmo: 1 request/1200ms
-  await wait(1200);
-
-  let tries = 0;
-  while (tries < 5) {
-    try {
-      const res = await fetch(url, {
-        headers: {
-          "user-agent": UA,
-          accept: "application/json",
-        },
-      });
-
-      if (res.status === 429) {
-        tries++;
-        await wait(2000 * tries);
-        continue;
+  try {
+    const { data } = await axios.get(ROBLOX_ENDPOINT, {
+      params,
+      timeout: 12000,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'petfinder-api/1.0 (+railway)'
       }
-
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-
-      const data = await res.json();
-      return {
-        data: Array.isArray(data.data) ? data.data : [],
-        next: data.nextPageCursor || null,
-      };
-    } catch (e) {
-      tries++;
-      await wait(1500 * tries);
-      if (tries >= 5) throw e;
+    });
+    return data;
+  } catch (e) {
+    const status = e.response && e.response.status;
+    if ((status === 429 || status >= 500) && tryNo < 6) {
+      const wait = Math.min(2000 * tryNo, 8000);
+      await delay(wait);
+      return getPage(cursor, tryNo + 1);
     }
+    throw e;
   }
 }
 
-async function collectServers(placeId) {
-  let collected = [];
+// recolector: junta hasta 500 o finaliza si no hay más
+async function collectServers() {
+  const list = [];
   const seen = new Set();
-  let cursor = null;
+  let cursor = undefined;
 
-  while (collected.length < MAX_TOTAL) {
-    const page = await fetchPage(placeId, cursor);
-    cursor = page.next;
+  while (list.length < TARGET_TOTAL) {
+    const page = await getPage(cursor);
+    if (!page || !Array.isArray(page.data)) break;
 
     for (const s of page.data) {
-      if (!s || !s.id || seen.has(s.id)) continue;
-      // Solo servidores públicos no llenos
-      if (s.playing < s.maxPlayers) {
-        seen.add(s.id);
-        collected.push({
-          id: s.id,
-          maxPlayers: s.maxPlayers,
-          playing: s.playing,
-        });
-        if (collected.length >= MAX_TOTAL) break;
+      if (!s || !s.id) continue;
+      if (seen.has(s.id)) continue;
+      // evitar llenos, y preferir jugables
+      if (typeof s.playing === 'number' && typeof s.maxPlayers === 'number') {
+        if (s.playing >= s.maxPlayers) continue;
       }
+      seen.add(s.id);
+      list.push({
+        id: s.id,
+        maxPlayers: s.maxPlayers,
+        playing: s.playing,
+        ping: s.ping,
+        fps: s.fps
+      });
+      if (list.length >= TARGET_TOTAL) break;
     }
 
+    cursor = page.nextPageCursor;
     if (!cursor) break;
+    await delay(200); // pequeña pausa para no spamear
   }
 
-  return collected;
+  return list;
 }
 
-async function refresh() {
+// refresco (con lock + espera para peticiones concurrentes)
+async function refreshNow() {
+  if (isRefreshing) {
+    return new Promise(resolve => waiters.push(resolve));
+  }
+  isRefreshing = true;
   try {
-    const servers = await collectServers(PLACE_ID);
-    cache = {
-      ok: true,
-      success: true,
-      totalFetched: servers.length,
-      servers,
-      updatedAt: Date.now(),
-    };
-  } catch (e) {
-    cache = {
-      ok: false,
-      success: false,
-      error: String(e && e.message ? e.message : e),
-      servers: [],
-      totalFetched: 0,
-      updatedAt: Date.now(),
-    };
+    const servers = await collectServers();
+    cache = { servers, updatedAt: Date.now() };
+  } finally {
+    isRefreshing = false;
+    while (waiters.length) waiters.shift()();
   }
 }
 
-app.get("/", (_req, res) => {
+// cron: cada 15 minutos
+setInterval(() => refreshNow().catch(()=>{}), REFRESH_MS);
+// primer warm-up en arranque
+refreshNow().catch(()=>{});
+
+// endpoints
+app.get('/', (req, res) => {
   res.json({
     ok: true,
-    success: true,
-    message: "petfinder-api",
+    name: 'petfinder-api',
     placeId: PLACE_ID,
-    updatedAt: cache.updatedAt,
+    refreshEachMs: REFRESH_MS,
+    target: TARGET_TOTAL,
+    endpoints: ['/servers', '/health']
   });
 });
 
-app.get("/servers", async (_req, res) => {
-  const stale = Date.now() - cache.updatedAt > REFRESH_EVERY_MS;
-  if (stale || !cache.updatedAt) {
-    await refresh();
-  }
-  res.json(cache);
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'healthy',
+    updatedAt: cache.updatedAt,
+    totalCached: cache.servers.length,
+    uptime: process.uptime()
+  });
 });
 
-app.listen(PORT, async () => {
-  await refresh();
-  setInterval(refresh, REFRESH_EVERY_MS);
+app.get('/servers', async (req, res) => {
+  const wantRefresh = String(req.query.refresh || '').trim() === '1';
+
+  try {
+    if (wantRefresh) {
+      await refreshNow();
+    } else if (Date.now() - cache.updatedAt > REFRESH_MS * 1.5 || cache.servers.length === 0) {
+      // caché viejo o vacío → refresco no-bloqueante
+      refreshNow().catch(()=>{});
+    }
+
+    res.json({
+      ok: true,
+      success: true,
+      totalFetched: cache.servers.length,
+      servers: cache.servers,
+      updatedAt: cache.updatedAt
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      success: false,
+      error: e.message || String(e),
+      servers: [],
+      totalFetched: 0,
+      updatedAt: cache.updatedAt || 0
+    });
+  }
 });
+
+app.use('*', (_req, res) => {
+  res.status(404).json({ ok:false, error:'not_found' });
+});
+
+app.listen(PORT, () => {
+  console.log(`petfinder-api listening on ${PORT}`);
+});
+
+module.exports = app;
