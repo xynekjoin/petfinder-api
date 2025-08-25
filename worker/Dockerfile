@@ -1,20 +1,18 @@
 # Imagen base de Node.js
-FROM node:18
+FROM node:18-alpine
 
-# Establece el directorio de trabajo dentro del contenedor
+# Establecer directorio de trabajo
 WORKDIR /app
 
-# Copia los archivos de definición de dependencias
-COPY package*.json ./
+# Copiar package.json e instalar dependencias
+COPY package.json ./
+RUN npm install --production
 
-# Instala dependencias
-RUN npm install
-
-# Copia el resto del código al contenedor
+# Copiar el resto del código
 COPY . .
 
-# Expone el puerto que usará Express
+# Exponer el puerto en el que correrá Express
 EXPOSE 3000
 
-# Comando por defecto para iniciar la app
+# Comando para iniciar la app
 CMD ["npm", "start"]
