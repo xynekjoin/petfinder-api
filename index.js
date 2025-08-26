@@ -6,27 +6,18 @@ const app  = express();
 app.use(cors());
 app.use(express.json());
 
-// ========= CONFIG MEDIANTE VARIABLES DE ENTORNO =========
-// Lista de URLs de micro-APIs separadas por coma
-// Ej: https://micro1.up.railway.app,https://micro2.up.railway.app,https://micro3.up.railway.app
+// ============ CONFIG ============
 const UPSTREAMS = (process.env.UPSTREAMS || '').split(',').map(s => s.trim()).filter(Boolean);
-
-// cuántas páginas pedir a cada micro en la misma request a la API principal
 const PAGES_PER_MICRO = parseInt(process.env.PAGES_PER_MICRO || '1', 10);
-
-// total deseado 
-const TARGET_TOTAL     = parseInt(process.env.TARGET_TOTAL || '500', 10);
-
-// timeout
+const TARGET_TOTAL    = parseInt(process.env.TARGET_TOTAL || '500', 10);
 const MICROS_TIMEOUT_MS = parseInt(process.env.MICROS_TIMEOUT_MS || '15000', 10);
+const PAGE_DELAY_MS     = parseInt(process.env.PAGE_DELAY_MS || '300', 10);
 
-// pequeño delay entre páginas a un mismo micro para respirar
-const PAGE_DELAY_MS = parseInt(process.env.PAGE_DELAY_MS || '300', 10);
+// memoria para reservas
+const reservations = new Map(); // jobId -> clientId
+const usedServers  = new Set(); // jobIds bloqueados
 
-// cada cuánto se refresca automáticamente el caché (por defecto 60s)
-const REFRESH_EACH_MS = parseInt(process.env.REFRESH_EACH_MS || '120000', 10);
-// ========================================================
-
+// ============ HELPERS ============
 function shuffle(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -43,11 +34,6 @@ function uniqById(list) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-/**
- * Llama a una micro-API para obtener 1 página.
- * Se asume que la micro-API expone GET /servers?cursor=...
- * y devuelve: { success:true, data:{ data:[...], nextPageCursor:"..." } }
- */
 async function fetchPageFromMicro(baseUrl, cursor) {
   const url = `${baseUrl.replace(/\/+$/,'')}/servers`;
   const params = {};
@@ -63,9 +49,6 @@ async function fetchPageFromMicro(baseUrl, cursor) {
   };
 }
 
-/**
- * Pide N páginas a una micro-API.
- */
 async function fetchFromOneMicro(baseUrl, pages) {
   let cursor = null;
   let list = [];
@@ -79,9 +62,6 @@ async function fetchFromOneMicro(baseUrl, pages) {
   return list;
 }
 
-/**
- * Pide en paralelo a todas las micro-APIs.
- */
 async function fetchFromAllMicros(pagesPerMicro) {
   if (!UPSTREAMS.length) throw new Error("No hay micro-APIs configuradas (UPSTREAMS)");
 
@@ -110,108 +90,72 @@ async function fetchFromAllMicros(pagesPerMicro) {
   return { all, details };
 }
 
-// ==================== CACHE AUTO-REFRESH ====================
-let CACHE = { servers: [], sources: [], updatedAt: 0 };
-
-async function rebuildCache() {
-  try {
-    const { all, details } = await fetchFromAllMicros(PAGES_PER_MICRO);
-    CACHE.servers  = all;
-    CACHE.sources  = details;
-    CACHE.updatedAt = Date.now();
-    console.log(`[CACHE] Rebuilt: ${all.length} servers - ${new Date(CACHE.updatedAt).toISOString()}`);
-  } catch (e) {
-    console.error('[CACHE] Error rebuilding cache:', e.message);
-  }
-}
-
-// Inicializa y programa el refresh
-(async () => {
-  await rebuildCache();
-  setInterval(rebuildCache, REFRESH_EACH_MS);
-})();
-// ============================================================
-
-// ======================= ROUTES =========================
+// ============ ROUTES ============
 app.get('/', (req, res) => {
   res.json({
     ok: true,
     name: 'petfinder-main',
     upstreams: UPSTREAMS,
-    config: {
-      PAGES_PER_MICRO,
-      TARGET_TOTAL,
-      MICROS_TIMEOUT_MS,
-      PAGE_DELAY_MS,
-      REFRESH_EACH_MS
-    },
-    endpoints: ['/servers', '/servers/live', '/refresh', '/health']
+    endpoints: ['/servers', '/next', '/release', '/health']
   });
 });
 
-app.get('/health', async (req, res) => {
+app.get('/health', (req, res) => {
   res.json({
     status: "healthy",
     micros: UPSTREAMS.length,
-    updatedAt: CACHE.updatedAt,
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
   });
 });
 
-/**
- * Devuelve los servidores del caché (refrescado en background).
- */
-app.get('/servers', (req, res) => {
-  res.json({
-    ok: true,
-    success: true,
-    totalFetched: CACHE.servers.length,
-    servers: CACHE.servers,
-    sources: CACHE.sources,
-    updatedAt: CACHE.updatedAt
-  });
-});
-
-/**
- * Fuerza la lectura en vivo desde micro-apis (útil para test).
- * Puedes pasar pages=<n> para cambiar N páginas por micro en esa llamada.
- */
-app.get('/servers/live', async (req, res) => {
+// --- Devuelve lista normal de servers (pool combinado)
+app.get('/servers', async (req, res) => {
   try {
     const pages = parseInt(req.query.pages || PAGES_PER_MICRO, 10);
     const { all, details } = await fetchFromAllMicros(pages);
-
-    res.json({
-      ok: true,
-      success: true,
-      totalFetched: all.length,
-      servers: all,
-      sources: details,
-      requestedPagesPerMicro: pages,
-      timestamp: new Date().toISOString()
-    });
+    res.json({ ok: true, servers: all, sources: details });
   } catch (err) {
-    res.status(500).json({ ok:false, success:false, error: err.message, servers: [], totalFetched: 0 });
+    res.status(500).json({ ok:false, error: err.message, servers: [] });
   }
 });
 
-/**
- * Endpoint para refrescar el caché manualmente.
- */
-app.get('/refresh', async (req, res) => {
-  await rebuildCache();
-  res.json({
-    ok: true,
-    refreshed: true,
-    totalFetched: CACHE.servers.length,
-    updatedAt: CACHE.updatedAt
-  });
+// --- Reserva un server exclusivo para un cliente
+app.post('/next', async (req, res) => {
+  const clientId = req.body.clientId;
+  if (!clientId) return res.status(400).json({ ok:false, error:"Missing clientId" });
+
+  try {
+    const { all } = await fetchFromAllMicros(1);
+    for (const s of all) {
+      if (!usedServers.has(s.id) && s.playing < s.maxPlayers) {
+        reservations.set(s.id, clientId);
+        usedServers.add(s.id);
+        return res.json({ ok:true, server:s });
+      }
+    }
+    res.json({ ok:false, error:"No available servers" });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
-// 404
+// --- Libera un server reservado
+app.post('/release', (req, res) => {
+  const { clientId, jobId } = req.body;
+  if (!clientId || !jobId) return res.status(400).json({ ok:false, error:"Missing clientId or jobId" });
+
+  if (reservations.get(jobId) === clientId) {
+    reservations.delete(jobId);
+    usedServers.delete(jobId);
+    return res.json({ ok:true, released:jobId });
+  }
+  res.json({ ok:false, error:"Reservation not found or not owned by this client" });
+});
+
+// --- 404
 app.use('*', (_, res) => res.status(404).json({ ok:false, error:'Not found' }));
 
-// Boot
+// --- Boot
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Main API listening on :${PORT}`));
