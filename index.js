@@ -23,6 +23,8 @@ const MICROS_TIMEOUT_MS = parseInt(process.env.MICROS_TIMEOUT_MS || '15000', 10)
 // pequeño delay entre páginas a un mismo micro para respirar
 const PAGE_DELAY_MS = parseInt(process.env.PAGE_DELAY_MS || '300', 10);
 
+// cada cuánto se refresca automáticamente el caché (por defecto 60s)
+const REFRESH_EACH_MS = parseInt(process.env.REFRESH_EACH_MS || '120000', 10);
 // ========================================================
 
 function shuffle(array) {
@@ -108,6 +110,28 @@ async function fetchFromAllMicros(pagesPerMicro) {
   return { all, details };
 }
 
+// ==================== CACHE AUTO-REFRESH ====================
+let CACHE = { servers: [], sources: [], updatedAt: 0 };
+
+async function rebuildCache() {
+  try {
+    const { all, details } = await fetchFromAllMicros(PAGES_PER_MICRO);
+    CACHE.servers  = all;
+    CACHE.sources  = details;
+    CACHE.updatedAt = Date.now();
+    console.log(`[CACHE] Rebuilt: ${all.length} servers - ${new Date(CACHE.updatedAt).toISOString()}`);
+  } catch (e) {
+    console.error('[CACHE] Error rebuilding cache:', e.message);
+  }
+}
+
+// Inicializa y programa el refresh
+(async () => {
+  await rebuildCache();
+  setInterval(rebuildCache, REFRESH_EACH_MS);
+})();
+// ============================================================
+
 // ======================= ROUTES =========================
 app.get('/', (req, res) => {
   res.json({
@@ -118,9 +142,10 @@ app.get('/', (req, res) => {
       PAGES_PER_MICRO,
       TARGET_TOTAL,
       MICROS_TIMEOUT_MS,
-      PAGE_DELAY_MS
+      PAGE_DELAY_MS,
+      REFRESH_EACH_MS
     },
-    endpoints: ['/servers', '/health']
+    endpoints: ['/servers', '/servers/live', '/refresh', '/health']
   });
 });
 
@@ -128,16 +153,31 @@ app.get('/health', async (req, res) => {
   res.json({
     status: "healthy",
     micros: UPSTREAMS.length,
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    updatedAt: CACHE.updatedAt,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
   });
 });
 
 /**
- * En cada request se llama a las micro-APIs y se retorna la union.
+ * Devuelve los servidores del caché (refrescado en background).
+ */
+app.get('/servers', (req, res) => {
+  res.json({
+    ok: true,
+    success: true,
+    totalFetched: CACHE.servers.length,
+    servers: CACHE.servers,
+    sources: CACHE.sources,
+    updatedAt: CACHE.updatedAt
+  });
+});
+
+/**
+ * Fuerza la lectura en vivo desde micro-apis (útil para test).
  * Puedes pasar pages=<n> para cambiar N páginas por micro en esa llamada.
  */
-app.get('/servers', async (req, res) => {
+app.get('/servers/live', async (req, res) => {
   try {
     const pages = parseInt(req.query.pages || PAGES_PER_MICRO, 10);
     const { all, details } = await fetchFromAllMicros(pages);
@@ -154,6 +194,19 @@ app.get('/servers', async (req, res) => {
   } catch (err) {
     res.status(500).json({ ok:false, success:false, error: err.message, servers: [], totalFetched: 0 });
   }
+});
+
+/**
+ * Endpoint para refrescar el caché manualmente.
+ */
+app.get('/refresh', async (req, res) => {
+  await rebuildCache();
+  res.json({
+    ok: true,
+    refreshed: true,
+    totalFetched: CACHE.servers.length,
+    updatedAt: CACHE.updatedAt
+  });
 });
 
 // 404
