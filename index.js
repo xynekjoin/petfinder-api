@@ -6,18 +6,16 @@ const app  = express();
 app.use(cors());
 app.use(express.json());
 
-// ============ CONFIG ============
-const UPSTREAMS = (process.env.UPSTREAMS || '').split(',').map(s => s.trim()).filter(Boolean);
-const PAGES_PER_MICRO = parseInt(process.env.PAGES_PER_MICRO || '1', 10);
-const TARGET_TOTAL    = parseInt(process.env.TARGET_TOTAL || '500', 10);
+const UPSTREAMS = (process.env.UPSTREAMS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const PAGES_PER_MICRO   = parseInt(process.env.PAGES_PER_MICRO || '1', 10);
+const TARGET_TOTAL      = parseInt(process.env.TARGET_TOTAL || '500', 10);
 const MICROS_TIMEOUT_MS = parseInt(process.env.MICROS_TIMEOUT_MS || '15000', 10);
-const PAGE_DELAY_MS     = parseInt(process.env.PAGE_DELAY_MS || '300', 10);
+const PAGE_DELAY_MS     = parseInt(process.env.PAGE_DELAY_MS || '250', 10);
 
-// memoria para reservas
-const reservations = new Map(); // jobId -> clientId
-const usedServers  = new Set(); // jobIds bloqueados
-
-// ============ HELPERS ============
 function shuffle(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -43,8 +41,12 @@ async function fetchPageFromMicro(baseUrl, cursor) {
   if (!data || !data.data || !Array.isArray(data.data.data)) {
     throw new Error(`Respuesta inesperada de micro ${baseUrl}`);
   }
+  const servers = (data.data.data || []).filter(s =>
+    Number(s.playing || 0) <= 7 && Number(s.playing || 0) < Number(s.maxPlayers || 8)
+  );
+
   return {
-    servers: data.data.data,
+    servers,
     nextCursor: data.data.nextPageCursor || null
   };
 }
@@ -83,6 +85,7 @@ async function fetchFromAllMicros(pagesPerMicro) {
     }
   }
 
+  all = all.filter(s => Number(s.playing || 0) <= 7 && Number(s.playing || 0) < Number(s.maxPlayers || 8));
   all = uniqById(all);
   shuffle(all);
   if (all.length > TARGET_TOTAL) all = all.slice(0, TARGET_TOTAL);
@@ -90,17 +93,22 @@ async function fetchFromAllMicros(pagesPerMicro) {
   return { all, details };
 }
 
-// ============ ROUTES ============
 app.get('/', (req, res) => {
   res.json({
     ok: true,
     name: 'petfinder-main',
     upstreams: UPSTREAMS,
-    endpoints: ['/servers', '/next', '/release', '/health']
+    config: {
+      PAGES_PER_MICRO,
+      TARGET_TOTAL,
+      MICROS_TIMEOUT_MS,
+      PAGE_DELAY_MS
+    },
+    endpoints: ['/servers', '/health']
   });
 });
 
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   res.json({
     status: "healthy",
     micros: UPSTREAMS.length,
@@ -109,53 +117,26 @@ app.get('/health', (req, res) => {
   });
 });
 
-// --- Devuelve lista normal de servers (pool combinado)
 app.get('/servers', async (req, res) => {
   try {
     const pages = parseInt(req.query.pages || PAGES_PER_MICRO, 10);
     const { all, details } = await fetchFromAllMicros(pages);
-    res.json({ ok: true, servers: all, sources: details });
+
+    res.json({
+      ok: true,
+      success: true,
+      totalFetched: all.length,
+      servers: all,
+      sources: details,
+      requestedPagesPerMicro: pages,
+      timestamp: new Date().toISOString()
+    });
   } catch (err) {
-    res.status(500).json({ ok:false, error: err.message, servers: [] });
+    res.status(500).json({ ok:false, success:false, error: err.message, servers: [], totalFetched: 0 });
   }
 });
 
-// --- Reserva un server exclusivo para un cliente
-app.post('/next', async (req, res) => {
-  const clientId = req.body.clientId;
-  if (!clientId) return res.status(400).json({ ok:false, error:"Missing clientId" });
-
-  try {
-    const { all } = await fetchFromAllMicros(1);
-    for (const s of all) {
-      if (!usedServers.has(s.id) && s.playing < s.maxPlayers) {
-        reservations.set(s.id, clientId);
-        usedServers.add(s.id);
-        return res.json({ ok:true, server:s });
-      }
-    }
-    res.json({ ok:false, error:"No available servers" });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:e.message });
-  }
-});
-
-// --- Libera un server reservado
-app.post('/release', (req, res) => {
-  const { clientId, jobId } = req.body;
-  if (!clientId || !jobId) return res.status(400).json({ ok:false, error:"Missing clientId or jobId" });
-
-  if (reservations.get(jobId) === clientId) {
-    reservations.delete(jobId);
-    usedServers.delete(jobId);
-    return res.json({ ok:true, released:jobId });
-  }
-  res.json({ ok:false, error:"Reservation not found or not owned by this client" });
-});
-
-// --- 404
 app.use('*', (_, res) => res.status(404).json({ ok:false, error:'Not found' }));
 
-// --- Boot
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Main API listening on :${PORT}`));
