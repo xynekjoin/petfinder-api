@@ -1,17 +1,26 @@
 {
-  "name": "petfinder-main-api",
-  "version": "1.2.0",
-  "description": "API principal: agrega micro-APIs, reserva exclusiva, filtro <=6 jugadores",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "axios": "^1.11.0",
-    "cors": "^2.8.5",
-    "express": "^4.21.2"
-  },
-  "engines": {
-    "node": ">=16.x"
-  }
+    "name": "roblox-servers-microapi",
+    "version": "1.0.0",
+    "description": "Micro API para obtener servidores de Roblox",
+    "main": "index.js",
+    "scripts": {
+        "start": "node index.js",
+        "dev": "nodemon index.js"
+    },
+    "dependencies": {
+        "axios": "^1.11.0",
+        "cors": "^2.8.5",
+        "express": "^4.21.2"
+    },
+    "devDependencies": {
+        "nodemon": "^3.0.1"
+    },
+    "keywords": [
+        "roblox",
+        "api",
+        "servers",
+        "microapi"
+    ],
+    "author": "Tu nombre",
+    "license": "MIT"
 }
